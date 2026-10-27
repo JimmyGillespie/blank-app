@@ -106,12 +106,12 @@ DEFAULT_LAYERS = [
      "Confirmed": "Yes", "Selected": True},
     {"Hazard": "Elevation / Susceptibility", "Layer": "us_fl_susceptibility", "Version": "latest",
      "LayerOptions": "", "Confirmed": "Yes", "Selected": True},
-    {"Hazard": "Earthquake", "Layer": "{region}_eq_hazard", "Version": "latest",
-     "LayerOptions": "", "Confirmed": "No - verify", "Selected": False},
-    {"Hazard": "Windstorm / Hurricane", "Layer": "{region}_ws_hazard", "Version": "latest",
-     "LayerOptions": "", "Confirmed": "No - verify", "Selected": False},
-    {"Hazard": "Wildfire", "Layer": "{region}_wf_hazard", "Version": "latest",
-     "LayerOptions": "", "Confirmed": "No - verify", "Selected": False},
+    {"Hazard": "Earthquake (name unconfirmed)", "Layer": "us_eq_sitehazard", "Version": "latest",
+     "LayerOptions": "", "Confirmed": "No - edit before use", "Selected": False},
+    {"Hazard": "Windstorm (name unconfirmed)", "Layer": "us_hu_hazard", "Version": "latest",
+     "LayerOptions": "", "Confirmed": "No - edit before use", "Selected": False},
+    {"Hazard": "Wildfire (name unconfirmed)", "Layer": "us_wf_hazard", "Version": "latest",
+     "LayerOptions": "", "Confirmed": "No - edit before use", "Selected": False},
 ]
 
 
@@ -261,14 +261,44 @@ def parse_layer_options(raw):
         return None
 
 
+def resolve_admin1_code(geo_payload, fallback_admin1):
+    """Hazard layers require a strict 2-letter admin1Code. Prefer the value
+    RMS itself resolved during geocoding (guaranteed valid) over whatever
+    free-text the user typed in the address form - this mirrors the
+    confirmed-working VBA macro's 'only send if exactly 2 chars' guard,
+    but is more robust because it trusts RMS's own resolution first."""
+    resolved = ""
+    if isinstance(geo_payload, dict):
+        resolved = str(geo_payload.get("admin1Code") or "").strip().upper()
+    if len(resolved) == 2:
+        return resolved
+    typed = str(fallback_admin1 or "").strip().upper()
+    if len(typed) == 2:
+        return typed
+    return ""
+
+
+STATUS_ICON = {"OK": "✅", "ERROR": "⚠️"}
+
+
 # --------------------------------------------------------------------------
 # Streamlit UI
 # --------------------------------------------------------------------------
 
 st.set_page_config(page_title="RMS Location Intelligence Explorer", page_icon="🌍", layout="wide")
 
+st.markdown(
+    """
+    <style>
+    .block-container { padding-top: 2rem; }
+    div[data-testid="stExpander"] { border: 1px solid #2b2f3a; border-radius: 8px; }
+    </style>
+    """,
+    unsafe_allow_html=True,
+)
+
 st.title("🌍 RMS Location Intelligence Explorer")
-st.write(
+st.caption(
     "Enter an address, see it on a map, and choose which RMS hazard layers to look up for that "
     "location. Request formats are ported from a confirmed-working RMS VBA macro."
 )
@@ -340,9 +370,13 @@ if test_conn:
 
 st.subheader("2. Hazard layers to look up")
 st.caption(
-    "The first 3 rows (FEMA FIRM, Flood Depth, Elevation/Susceptibility) use the exact request "
-    "shape confirmed working in your RMS workbook macro. Other perils are best-effort - adjust the "
-    "layer name if you get an ERR_4040 'not found'."
+    "✅ The first 3 rows (FEMA FIRM, Flood Depth, Elevation/Susceptibility) use the exact request "
+    "shape confirmed working in your RMS workbook macro - these just work. "
+    "⚠️ The remaining rows are **unconfirmed guesses** at the layer name - the US product line does "
+    "not follow the generic `<region>_<peril>_hazard` pattern used for other regions, so these will "
+    "likely return 'No details found for layer name...' until you correct the name. Find the exact "
+    "name in your tenant's Postman collection / OpenAPI spec (Developer Assets on developer.rms.com), "
+    "or in an existing working macro/report, then edit the 'Layer name' cell directly below."
 )
 
 catalog_df = pd.DataFrame(DEFAULT_LAYERS)
@@ -386,6 +420,7 @@ if run:
             lat = geo_payload.get("latitude")
             lon = geo_payload.get("longitude")
             resolution_code = geo_payload.get("rmsGeoModelResolutionCode") or 1
+            resolved_admin1 = resolve_admin1_code(geo_payload, admin1)
             st.session_state["li_latlon"] = (lat, lon)
             st.session_state["li_resolution"] = resolution_code
 
@@ -400,7 +435,7 @@ if run:
                     for row in selected_layers:
                         layer_options = parse_layer_options(row.get("LayerOptions"))
                         r_payload, r_status, r_error = api.hazard_lookup(
-                            lat, lon, admin1, country_code.strip().upper() or "US",
+                            lat, lon, resolved_admin1, country_code.strip().upper() or "US",
                             resolution_code, row["Layer"], row["Version"] or version_default,
                             layer_options,
                         )
@@ -408,8 +443,20 @@ if run:
                             results.append({"name": row["Layer"], "version": row["Version"],
                                              "results": r_payload, "errors": []})
                         else:
-                            code = "ERR_4040" if r_status == 404 else "ERR_HTTP"
-                            message = ERROR_CODES.get(code, f"HTTP {r_status}: {r_error}")
+                            # Surface RMS's own error code/message when available, so the
+                            # user sees exactly why a layer failed (e.g. "No details found
+                            # for layer name X" means the layer name itself is wrong).
+                            api_errors = []
+                            if isinstance(r_error, dict):
+                                api_errors = r_error.get("errors") or []
+                            if api_errors:
+                                code = api_errors[0].get("code", "ERR_HTTP")
+                                message = api_errors[0].get("message") or ERROR_CODES.get(code, "Unknown error")
+                                if "no details found for layer name" in message.lower():
+                                    message += " — this layer name is likely incorrect for this region/product; verify it in your tenant's layer catalog."
+                            else:
+                                code = "ERR_4040" if r_status == 404 else "ERR_HTTP"
+                                message = f"HTTP {r_status}: {r_error}"
                             results.append({"name": row["Layer"], "version": row["Version"], "results": {},
                                              "errors": [{"code": code, "message": message}]})
             else:
@@ -425,45 +472,84 @@ results = st.session_state["li_results"]
 latlon = st.session_state["li_latlon"]
 
 if results is not None:
-    st.subheader("3. Map")
+    geocode_entry = next((e for e in results if e.get("name") == "geocode"), None)
+    geo_data = (geocode_entry or {}).get("results") or {}
+    hazard_entries = [e for e in results if e.get("name") != "geocode"]
+    ok_count = sum(1 for e in hazard_entries if not e.get("errors"))
+    err_count = len(hazard_entries) - ok_count
+
+    st.divider()
+    st.subheader("📍 Resolved location")
+
     if latlon and latlon[0] is not None and latlon[1] is not None:
-        map_df = pd.DataFrame({"lat": [latlon[0]], "lon": [latlon[1]]})
-        st.map(map_df, zoom=13)
-        st.caption(format_latlon_caption(latlon[0], latlon[1]))
+        left, right = st.columns([3, 2])
+        with left:
+            map_df = pd.DataFrame({"lat": [latlon[0]], "lon": [latlon[1]]})
+            st.map(map_df, zoom=14)
+        with right:
+            st.markdown(f"**{geo_data.get('streetAddress') or street or '—'}**")
+            city_line = ", ".join(filter(None, [
+                geo_data.get("cityName") or city,
+                geo_data.get("admin1Code") or admin1,
+                geo_data.get("postalCode") or postal,
+            ]))
+            st.markdown(city_line or "—")
+            st.caption(format_latlon_caption(latlon[0], latlon[1]))
+            m1, m2 = st.columns(2)
+            m1.metric("Match resolution", geo_data.get("rmsGeocodingResolutionCode", "—"))
+            m2.metric("Model resolution", geo_data.get("rmsGeoModelResolutionCode", "—"))
     else:
         st.info("No coordinates were returned for this address - check the geocode result below.")
 
-    st.subheader("4. Hazard results")
+    st.divider()
+    header_col1, header_col2 = st.columns([3, 1])
+    with header_col1:
+        st.subheader("🌪️ Hazard results")
+    with header_col2:
+        if hazard_entries:
+            st.markdown(
+                f"<div style='text-align:right; padding-top:0.6em;'>"
+                f"✅ {ok_count} succeeded&nbsp;&nbsp;·&nbsp;&nbsp;⚠️ {err_count} failed</div>",
+                unsafe_allow_html=True,
+            )
+
     all_rows = []
     for entry in results:
         name = entry.get("name", "unknown")
         version = entry.get("version", "")
         errors = entry.get("errors") or []
-        panel_title = "📍 {}  ·  v{}".format(name, version)
-        with st.expander(panel_title, expanded=(name == "geocode")):
+        is_geocode = name == "geocode"
+        icon = "🧭" if is_geocode else STATUS_ICON["ERROR" if errors else "OK"]
+        panel_title = f"{icon}  **{name}**  ·  v{version}"
+        with st.expander(panel_title, expanded=False):
             if errors:
                 for err in errors:
                     code = err.get("code", "")
                     message = ERROR_CODES.get(code, err.get("message", "Unknown error"))
-                    st.warning("{}: {}".format(code, message))
+                    st.error(f"`{code}` — {message}")
             layer_results = entry.get("results") or {}
             if layer_results:
                 rows = flatten_for_table(name, layer_results)
                 all_rows.extend(rows)
-                table_df = pd.DataFrame(rows).drop(columns=["Layer"])
+                table_df = pd.DataFrame(rows).drop(columns=["Layer"]).rename(
+                    columns={"Field": "Field", "Value": "Value"}
+                )
                 st.dataframe(table_df, width="stretch", hide_index=True)
             elif not errors:
                 st.caption("No data returned for this layer.")
 
     if all_rows:
         results_df = pd.DataFrame(all_rows)
-        st.subheader("5. Export")
+        st.divider()
+        st.subheader("⬇️ Export")
         csv_bytes = results_df.to_csv(index=False).encode("utf-8")
         json_bytes = json.dumps(results, indent=2, default=str).encode("utf-8")
         col1, col2 = st.columns(2)
         with col1:
-            st.download_button("⬇️ Download as CSV", data=csv_bytes,
-                                file_name="rms_location_intelligence.csv", mime="text/csv")
+            st.download_button("Download as CSV", data=csv_bytes,
+                                file_name="rms_location_intelligence.csv", mime="text/csv",
+                                width="stretch")
         with col2:
-            st.download_button("⬇️ Download raw JSON", data=json_bytes,
-                                file_name="rms_location_intelligence.json", mime="application/json")
+            st.download_button("Download raw JSON", data=json_bytes,
+                                file_name="rms_location_intelligence.json", mime="application/json",
+                                width="stretch")
