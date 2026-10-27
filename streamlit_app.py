@@ -5,22 +5,44 @@ RMS Location Intelligence Explorer (Streamlit)
 Enter an address, see it plotted on a map, and pick which RMS Location
 Intelligence hazard layers you want enriched for that location.
 
-Workflow (per https://developer.rms.com/location-intelligence):
-  1. Geocode the address -> resolves lat/long + admin codes.
-  2. Hazard lookup -> enrich the geocoded location with peril-specific hazard
-     data (earthquake, windstorm, flood, wildfire, convective storm, winter
-     storm, terrorism, etc.).
+Request shapes in this file are ported directly from a CONFIRMED-WORKING
+Excel VBA macro (modFloodGeo) that successfully calls the same API:
 
-Both steps are combined into a single call to the Composite Lookup endpoint
-(POST https://{host}/li/composite), which geocodes once and then runs every
-selected hazard layer against the resolved location in one round trip:
+  Host + app path : https://{host}/li/   (host = api-euw1.rms.com or api-use1.rms.com)
+  Auth header     : Authorization: {api_key}   <- RAW key, no "Bearer " prefix
 
-    https://developer.rms.com/location-intelligence/reference/composite-1
+  1) Geocode  (POST {host}/li/geocode/{version})
+     Body is the address fields FLAT at the top level (NOT wrapped in a
+     "location"/"address" object):
+         {"countryScheme":"ISO2A","countryCode":"US","streetAddress":"...",
+          "cityName":"...","admin1Code":"...","postalCode":"..."}
+     Response includes latitude, longitude, rmsGeoModelResolutionCode.
 
-Layer naming follows the documented <region>_<peril>_hazard convention
-(e.g. us_eq_hazard, ac_eq_hazard, au_eq_hazard). Layer availability and
-exact naming can vary by tenant/vintage, so every layer name + version is
-editable in the table below before running.
+  2) Hazard lookup (POST {host}/li/{layer}/{version}, e.g. us_fema_firm,
+     us_fl_depth, us_fl_susceptibility)
+     Body nests the geocoded coordinates under location.address, with
+     sibling "characteristics" / "coverageValues" objects, and an optional
+     "layerOptions" object as a SIBLING of "location" (not nested inside it):
+         {
+           "location": {
+             "address": {"countryScheme":"ISO2A","countryCode":"US",
+                          "countryRmsCode":"US","admin1Code":"...",
+                          "latitude":..,"longitude":..,
+                          "rmsGeoModelResolutionCode":1},
+             "characteristics": {"construction":"ATC0","occupancy":"ATC0",
+                 "yearBuilt":0,"numOfStories":0,"foundationType":0,
+                 "firstFloorHeightAboveGround":0,"basement":"DEFAULT","floorArea":0},
+             "coverageValues": {"buildingValue":0,"contentsValue":0,
+                 "businessInterruptionValue":0}
+           },
+           "layerOptions": {"distanceUnit":"feet","proximityDistance":100}
+         }
+
+Only the three flood layers above (FEMA FIRM, Flood Depth, Elevation/
+Susceptibility) are confirmed working. Earthquake / windstorm / wildfire
+layer names follow RMS's documented <region>_<peril>_hazard convention but
+are NOT independently confirmed - they are included as editable best-effort
+rows; verify/adjust the layer name if one returns ERR_4040 (not found).
 """
 
 import os
@@ -72,47 +94,47 @@ ERROR_CODES = {
     "ERR_5040": "Gateway timeout.",
 }
 
+# Confirmed-working flood layers (ported 1:1 from the VBA macro), plus
+# best-effort rows for other perils using RMS's documented naming
+# convention. Edit any Layer/Version/LayerOptions before running if your
+# tenant differs.
 DEFAULT_LAYERS = [
-    {"Hazard": "Earthquake", "Layer": "{region}_eq_hazard", "Version": "latest", "Selected": True},
-    {"Hazard": "Windstorm / Hurricane", "Layer": "{region}_ws_hazard", "Version": "latest", "Selected": True},
-    {"Hazard": "Flood", "Layer": "{region}_fl_hazard", "Version": "latest", "Selected": True},
-    {"Hazard": "Wildfire", "Layer": "{region}_wf_hazard", "Version": "latest", "Selected": True},
-    {"Hazard": "Severe Convective Storm", "Layer": "{region}_cs_hazard", "Version": "latest", "Selected": False},
-    {"Hazard": "Winter Storm", "Layer": "{region}_wt_hazard", "Version": "latest", "Selected": False},
-    {"Hazard": "Terrorism", "Layer": "{region}_tr_hazard", "Version": "latest", "Selected": False},
-    {"Hazard": "Earthquake Intensity (MMI)", "Layer": "{region}_mmi", "Version": "latest", "Selected": False},
-    {"Hazard": "Distance to Fault", "Layer": "{region}_distance_to_fault", "Version": "latest", "Selected": False},
-    {"Hazard": "Distance to Coast", "Layer": "{region}_distance_to_coast", "Version": "latest", "Selected": False},
+    {"Hazard": "US FEMA FIRM (flood zone)", "Layer": "us_fema_firm", "Version": "latest",
+     "LayerOptions": '{"distanceUnit":"feet","proximityDistance":100}', "Confirmed": "Yes", "Selected": True},
+    {"Hazard": "US Flood Depth (undefended)", "Layer": "us_fl_depth", "Version": "latest",
+     "LayerOptions": '{"lookup":"floodDepth","proximityDistance":100,"distanceUnit":"feet"}',
+     "Confirmed": "Yes", "Selected": True},
+    {"Hazard": "Elevation / Susceptibility", "Layer": "us_fl_susceptibility", "Version": "latest",
+     "LayerOptions": "", "Confirmed": "Yes", "Selected": True},
+    {"Hazard": "Earthquake", "Layer": "{region}_eq_hazard", "Version": "latest",
+     "LayerOptions": "", "Confirmed": "No - verify", "Selected": False},
+    {"Hazard": "Windstorm / Hurricane", "Layer": "{region}_ws_hazard", "Version": "latest",
+     "LayerOptions": "", "Confirmed": "No - verify", "Selected": False},
+    {"Hazard": "Wildfire", "Layer": "{region}_wf_hazard", "Version": "latest",
+     "LayerOptions": "", "Confirmed": "No - verify", "Selected": False},
 ]
 
 
 # --------------------------------------------------------------------------
-# API client
+# API client (mirrors the confirmed-working VBA request shapes exactly)
 # --------------------------------------------------------------------------
 
 class LocationIntelligenceApi:
     """Thin, resilient wrapper around the RMS Location Intelligence API."""
 
-    def __init__(self, host, api_key, auth_style="API key (raw)", verify=True, pool_size=16):
+    def __init__(self, host, api_key, verify=True, pool_size=16):
         self.base_url = f"https://{host}/li"
         self.session = requests.Session()
         adapter = HTTPAdapter(pool_connections=pool_size, pool_maxsize=pool_size)
         self.session.mount("https://", adapter)
         self.session.mount("http://", adapter)
-        # RMS's own docs show the Authorization header as the raw API key with NO
-        # "Bearer " prefix: `Authorization: {api_key}`. Only OAuth access tokens
-        # (a different credential type) would use "Bearer <token>".
-        # https://developer.rms.com/location-intelligence/docs/authentication-and-authorization
         clean_key = (api_key or "").strip()
-        # Guard against accidentally double-prefixing if a user pastes a key that
-        # already includes "Bearer " themselves.
         if clean_key.lower().startswith("bearer "):
             clean_key = clean_key[7:].strip()
-        auth_value = f"Bearer {clean_key}" if auth_style == "OAuth access token" else clean_key
         self.session.headers.update({
             "Accept": "application/json",
             "Content-Type": "application/json",
-            "Authorization": auth_value,
+            "Authorization": clean_key,  # RAW key - no "Bearer " prefix (confirmed via working VBA macro)
         })
         self.session.verify = verify
         self.lock = threading.Lock()
@@ -159,19 +181,52 @@ class LocationIntelligenceApi:
                 return None, 0, last_exc
         return None, 0, last_exc
 
-    def geocode(self, address, version="latest"):
-        body = {"location": {"address": address}}
+    def geocode(self, street, city, admin1, postal, country_code, version="latest"):
+        """Flat address body - matches FG_Step1_Geocode in the VBA macro exactly."""
+        country_code = (country_code or "US").upper()
+        if country_code == "USA":
+            country_code = "US"
+        body = {"countryScheme": "ISO2A", "countryCode": country_code}
+        if street:
+            body["streetAddress"] = street
+        if city:
+            body["cityName"] = city
+        if admin1:
+            body["admin1Code"] = admin1
+        if postal:
+            body["postalCode"] = postal
         return self._post(f"geocode/{version}", body)
 
-    def composite(self, address, layers):
-        body = {
-            "location": {"address": address},
-            "layers": [{"name": l["layer"], "version": l["version"]} for l in layers],
+    def hazard_lookup(self, lat, lon, admin1_code, country_code, resolution_code,
+                       layer, version, layer_options=None):
+        """Nested location/characteristics/coverageValues body - matches
+        BuildBody() in the VBA macro exactly."""
+        address = {
+            "countryScheme": "ISO2A",
+            "countryCode": country_code,
+            "countryRmsCode": country_code,
         }
-        return self._post("composite", body)
+        if admin1_code:
+            address["admin1Code"] = admin1_code
+        address["latitude"] = lat
+        address["longitude"] = lon
+        address["rmsGeoModelResolutionCode"] = resolution_code
 
-    def lookup_layer(self, address, layer, version):
-        body = {"location": {"address": address}}
+        body = {
+            "location": {
+                "address": address,
+                "characteristics": {
+                    "construction": "ATC0", "occupancy": "ATC0", "yearBuilt": 0,
+                    "numOfStories": 0, "foundationType": 0,
+                    "firstFloorHeightAboveGround": 0, "basement": "DEFAULT", "floorArea": 0,
+                },
+                "coverageValues": {
+                    "buildingValue": 0, "contentsValue": 0, "businessInterruptionValue": 0,
+                },
+            }
+        }
+        if layer_options:
+            body["layerOptions"] = layer_options
         return self._post(f"{layer}/{version}", body)
 
 
@@ -179,29 +234,7 @@ class LocationIntelligenceApi:
 # Helpers
 # --------------------------------------------------------------------------
 
-def build_address_payload(street, city, admin1, postal, country_code):
-    address = {"countryCode": country_code, "countryScheme": "ISO2A"}
-    if street:
-        address["streetAddress"] = street
-    if city:
-        address["cityName"] = city
-    if admin1:
-        address["admin1Code"] = admin1
-    if postal:
-        address["postalCode"] = postal
-    return address
-
-
-def extract_latlong(geocode_results):
-    if not isinstance(geocode_results, dict):
-        return None, None
-    lat = geocode_results.get("latitude")
-    lon = geocode_results.get("longitude")
-    return lat, lon
-
-
 def flatten_for_table(layer_name, results):
-    """Turn a layer's results dict into flat rows for display/export."""
     if not isinstance(results, dict):
         return []
     rows = []
@@ -213,10 +246,19 @@ def flatten_for_table(layer_name, results):
 
 
 def format_latlon_caption(lat, lon):
-    """Build the 'Resolved coordinates' caption safely (avoids f-string nesting issues)."""
     lat_str = "{:.6f}".format(lat)
     lon_str = "{:.6f}".format(lon)
     return "Resolved coordinates: " + lat_str + ", " + lon_str
+
+
+def parse_layer_options(raw):
+    raw = (raw or "").strip()
+    if not raw:
+        return None
+    try:
+        return json.loads(raw)
+    except (ValueError, TypeError):
+        return None
 
 
 # --------------------------------------------------------------------------
@@ -228,83 +270,68 @@ st.set_page_config(page_title="RMS Location Intelligence Explorer", page_icon="�
 st.title("🌍 RMS Location Intelligence Explorer")
 st.write(
     "Enter an address, see it on a map, and choose which RMS hazard layers to look up for that "
-    "location — earthquake, windstorm, flood, wildfire, and more."
+    "location. Request formats are ported from a confirmed-working RMS VBA macro."
 )
 
 if "li_results" not in st.session_state:
     st.session_state["li_results"] = None
 if "li_latlon" not in st.session_state:
     st.session_state["li_latlon"] = None
+if "li_resolution" not in st.session_state:
+    st.session_state["li_resolution"] = None
 
 with st.sidebar:
     st.header("Connection")
     host = st.text_input("Host", value=DEFAULT_HOST, help="api-euw1.rms.com or api-use1.rms.com")
     api_key = st.text_input("API key", value=API_KEY, type="password",
-                             help="Defaults to the RMS_LI_API_KEY environment variable.")
-    auth_style = st.selectbox(
-        "Credential type",
-        ["API key (raw)", "OAuth access token"],
-        index=0,
-        help="RMS's recommended, production credential is a raw API key sent as "
-             "'Authorization: {api_key}' (no 'Bearer ' prefix). Only choose "
-             "'OAuth access token' if your tenant issued you a short-lived OAuth "
-             "token instead - that is sent as 'Authorization: Bearer {token}'.",
-    )
+                             help="Raw API key, sent as-is in the Authorization header (no 'Bearer ' prefix).")
     verify_ssl = st.checkbox("Verify SSL", value=True,
                               help="Uncheck only if you hit corporate SSL/proxy errors.")
-    region_code = st.text_input("Region code", value="us",
-                                 help="Prefix used in <region>_<peril>_hazard layer names, "
-                                      "e.g. 'us', 'ca', 'eu', 'au'.")
+    region_code = st.text_input("Region code (for unconfirmed layers)", value="us")
     version_default = st.text_input("Default layer version", value="latest")
 
     st.divider()
-    st.caption(
-        "**If you get HTTP 401 Unauthorized:** this almost always means either (a) the "
-        "Authorization header format is wrong for this credential type, or (b) this specific "
-        "API key is not entitled/licensed for the **Location Intelligence** product. Location "
-        "Intelligence is a separately licensed API from Risk Modeler / Risk Data API - a key "
-        "that works for analysis/AAL lookups will *not* automatically work here. Confirm with "
-        "your tenant admin that this key (or a new one) has Location Intelligence access."
-    )
     test_conn = st.button("🔌 Test connection (geocode only)")
+    st.caption(
+        "If you still get HTTP 401 after this fix: confirm the pasted API key is EXACTLY the one "
+        "working in your RMS workbook macro, with no extra spaces or truncation, and that this key "
+        "is licensed for Location Intelligence specifically (not just Risk Modeler / Risk Data API)."
+    )
 
 st.subheader("1. Address")
 col1, col2, col3, col4 = st.columns([3, 2, 1, 1])
 with col1:
-    street = st.text_input("Street address", placeholder="98 East First Street")
+    street = st.text_input("Street address", placeholder="766 Ocean Ave")
 with col2:
-    city = st.text_input("City", placeholder="Donora")
+    city = st.text_input("City", placeholder="Sea Bright")
 with col3:
-    admin1 = st.text_input("State / Admin1", placeholder="PA")
+    admin1 = st.text_input("State / Admin1", placeholder="NJ")
 with col4:
-    postal = st.text_input("Postal code", placeholder="15033")
+    postal = st.text_input("Postal code", placeholder="07760")
 country_code = st.text_input("Country code (ISO2)", value="US", max_chars=2)
 
 if test_conn:
     if not api_key:
         st.warning("Please provide an API key (sidebar) before testing the connection.")
     else:
-        test_api = LocationIntelligenceApi(host.strip(), api_key, auth_style=auth_style, verify=verify_ssl)
-        test_address = {
-            "countryCode": "US", "countryScheme": "ISO2A",
-            "streetAddress": "7575 Gateway Blvd", "cityName": "Newark",
-            "admin1Code": "CA", "postalCode": "94560",
-        }
+        test_api = LocationIntelligenceApi(host.strip(), api_key, verify=verify_ssl)
         with st.spinner("Sending a minimal test geocode request..."):
-            test_payload, test_status, test_error = test_api.geocode(test_address, version_default)
+            test_payload, test_status, test_error = test_api.geocode(
+                "7575 Gateway Blvd", "Newark", "CA", "94560", "US", version_default
+            )
+        masked = ("*" * max(len(api_key.strip()) - 4, 0)) + api_key.strip()[-4:]
         st.write(f"**Request URL:** `https://{host.strip()}/li/geocode/{version_default}`")
-        st.write(f"**Auth header sent:** `Authorization: {'Bearer ' if auth_style == 'OAuth access token' else ''}{'*' * max(len(api_key.strip()) - 4, 0)}{api_key.strip()[-4:] if len(api_key.strip()) >= 4 else ''}`")
+        st.write(f"**Authorization header sent:** `{masked}`")
         st.write(f"**HTTP status:** `{test_status}`")
         if test_status == 200:
-            st.success("✅ Connection succeeded - this API key and host are authorized for Location Intelligence.")
+            st.success("✅ Connection succeeded - this key and host are authorized for Location Intelligence.")
             st.json(test_payload)
         elif test_status == 401:
             st.error(
-                "❌ 401 Unauthorized. The host and key were reachable, but rejected. Most likely "
-                "causes: (1) this API key is provisioned for a different RMS product (e.g. Risk "
-                "Modeler / Risk Data API) and does not have Location Intelligence entitlements, or "
-                "(2) the key has expired or was revoked. Contact your tenant admin to confirm this "
-                "key (or request a new one) is licensed specifically for Location Intelligence."
+                "❌ 401 Unauthorized. Double-check this is the exact same key used successfully in "
+                "your working RMS Excel macro (copy it again from the workbook's RMS_TOKEN constant "
+                "or named range RMS_API_KEY, with no extra characters), and that 'host' matches "
+                "exactly ('api-euw1.rms.com', no https://, no trailing slash)."
             )
             st.json(test_error)
         else:
@@ -313,8 +340,9 @@ if test_conn:
 
 st.subheader("2. Hazard layers to look up")
 st.caption(
-    "Layer names follow RMS's documented `<region>_<peril>_hazard` convention. Edit names/versions "
-    "below if your tenant's Location Intelligence layer catalog differs."
+    "The first 3 rows (FEMA FIRM, Flood Depth, Elevation/Susceptibility) use the exact request "
+    "shape confirmed working in your RMS workbook macro. Other perils are best-effort - adjust the "
+    "layer name if you get an ERR_4040 'not found'."
 )
 
 catalog_df = pd.DataFrame(DEFAULT_LAYERS)
@@ -326,6 +354,8 @@ edited_df = st.data_editor(
         "Hazard": st.column_config.TextColumn("Hazard", disabled=True),
         "Layer": st.column_config.TextColumn("Layer name"),
         "Version": st.column_config.TextColumn("Version"),
+        "LayerOptions": st.column_config.TextColumn("Layer options (JSON, optional)"),
+        "Confirmed": st.column_config.TextColumn("Confirmed?", disabled=True),
     },
     hide_index=True,
     width="stretch",
@@ -341,43 +371,51 @@ if run:
     elif not (street or (city and admin1) or postal):
         st.warning("Please enter at least a street address, or a city + state, or a postal code.")
     else:
-        selected_layers = [
-            {"hazard": row["Hazard"], "layer": row["Layer"], "version": row["Version"] or version_default}
-            for _, row in edited_df.iterrows()
-            if row.get("Selected") and str(row.get("Layer", "")).strip()
-        ]
-        address = build_address_payload(street, city, admin1, postal, country_code.strip().upper() or "US")
-        api = LocationIntelligenceApi(host.strip(), api_key, auth_style=auth_style, verify=verify_ssl)
+        api = LocationIntelligenceApi(host.strip(), api_key, verify=verify_ssl)
 
-        with st.spinner("Geocoding address and looking up hazard layers..."):
-            payload, status, error = api.composite(address, selected_layers)
+        with st.spinner("Geocoding address..."):
+            geo_payload, geo_status, geo_error = api.geocode(
+                street, city, admin1, postal, country_code, version_default
+            )
 
-        if status != 200 or payload is None:
-            st.error("Composite lookup failed (HTTP {}). Falling back to individual layer calls...".format(status))
-            # Fallback: geocode first, then call each hazard layer separately.
-            geo_payload, geo_status, geo_error = api.geocode(address, version_default)
-            if geo_status != 200 or geo_payload is None:
-                st.error("Geocoding failed (HTTP {}): {}".format(geo_status, geo_error))
-            else:
-                lat, lon = extract_latlong(geo_payload)
-                st.session_state["li_latlon"] = (lat, lon)
-                results = [{"name": "geocode", "version": version_default, "results": geo_payload, "errors": []}]
-                for layer in selected_layers:
-                    r_payload, r_status, r_error = api.lookup_layer(address, layer["layer"], layer["version"])
-                    if r_status == 200 and r_payload is not None:
-                        results.append({"name": layer["layer"], "version": layer["version"],
-                                         "results": r_payload, "errors": []})
-                    else:
-                        err_msg = "HTTP {}: {}".format(r_status, r_error)
-                        results.append({"name": layer["layer"], "version": layer["version"], "results": {},
-                                         "errors": [{"code": "ERR_HTTP", "message": err_msg}]})
-                st.session_state["li_results"] = results
+        if geo_status != 200 or geo_payload is None:
+            st.error(f"Geocoding failed (HTTP {geo_status}): {geo_error}")
+            st.session_state["li_results"] = None
+            st.session_state["li_latlon"] = None
         else:
-            st.session_state["li_results"] = payload
-            geocode_entry = next((item for item in payload if item.get("name") == "geocode"), None)
-            if geocode_entry:
-                lat, lon = extract_latlong(geocode_entry.get("results"))
-                st.session_state["li_latlon"] = (lat, lon)
+            lat = geo_payload.get("latitude")
+            lon = geo_payload.get("longitude")
+            resolution_code = geo_payload.get("rmsGeoModelResolutionCode") or 1
+            st.session_state["li_latlon"] = (lat, lon)
+            st.session_state["li_resolution"] = resolution_code
+
+            results = [{"name": "geocode", "version": version_default, "results": geo_payload, "errors": []}]
+
+            if lat and lon:
+                selected_layers = [
+                    row for _, row in edited_df.iterrows()
+                    if row.get("Selected") and str(row.get("Layer", "")).strip()
+                ]
+                with st.spinner(f"Looking up {len(selected_layers)} hazard layer(s)..."):
+                    for row in selected_layers:
+                        layer_options = parse_layer_options(row.get("LayerOptions"))
+                        r_payload, r_status, r_error = api.hazard_lookup(
+                            lat, lon, admin1, country_code.strip().upper() or "US",
+                            resolution_code, row["Layer"], row["Version"] or version_default,
+                            layer_options,
+                        )
+                        if r_status == 200 and r_payload is not None:
+                            results.append({"name": row["Layer"], "version": row["Version"],
+                                             "results": r_payload, "errors": []})
+                        else:
+                            code = "ERR_4040" if r_status == 404 else "ERR_HTTP"
+                            message = ERROR_CODES.get(code, f"HTTP {r_status}: {r_error}")
+                            results.append({"name": row["Layer"], "version": row["Version"], "results": {},
+                                             "errors": [{"code": code, "message": message}]})
+            else:
+                st.warning("Geocoding succeeded but returned no coordinates - hazard lookups were skipped.")
+
+            st.session_state["li_results"] = results
 
 # --------------------------------------------------------------------------
 # Results
