@@ -400,6 +400,38 @@ def soil_risk_badge(description):
     return "🟢" if "stiff" in d or "rock" in d else "🟡"
 
 
+def get_cresta_zone(geo_data):
+    """CRESTA (Catastrophe Risk Evaluation and Standardizing Target
+    Accumulations) zone - the insurance industry's standard geographic
+    accumulation-management unit for earthquake/windstorm exposure.
+    RMS returns this as zone1Code in the geocode response (confirmed via
+    the working VBA macro's LH_GetCresta / SubCresta logic, which reads
+    the same zone1Code field)."""
+    code = (geo_data or {}).get("zone1Code") or ""
+    name = (geo_data or {}).get("zone1Name") or ""
+    return str(code).strip(), str(name).strip()
+
+
+def mmi_gauge_html(mmi_value, label):
+    """Renders a 1-12 MMI scale as a horizontal colour gradient with a
+    marker at the current value - green (not felt) through red (extreme)."""
+    try:
+        v = float(mmi_value)
+    except (TypeError, ValueError):
+        return ""
+    pct = max(0.0, min(100.0, (v - 1) / 11 * 100))
+    return f"""
+    <div class="mmi-gauge-wrap">
+        <div class="mmi-gauge-track">
+            <div class="mmi-gauge-marker" style="left: calc({pct}% - 2px);"></div>
+        </div>
+        <div class="mmi-scale-labels">
+            <span>I · Not felt</span><span>VI · Strong</span><span>XII · Extreme</span>
+        </div>
+    </div>
+    """
+
+
 def get_layer_results(results, layer_name):
     for entry in results or []:
         if entry.get("name") == layer_name:
@@ -416,8 +448,57 @@ st.set_page_config(page_title="RMS Location Intelligence Explorer", page_icon="�
 st.markdown(
     """
     <style>
-    .block-container { padding-top: 2rem; }
-    div[data-testid="stExpander"] { border: 1px solid #2b2f3a; border-radius: 8px; }
+    .block-container { padding-top: 2rem; max-width: 1200px; }
+    div[data-testid="stExpander"] { border: 1px solid rgba(135,135,135,0.25); border-radius: 10px; }
+
+    .risk-hero {
+        border-radius: 16px;
+        padding: 1.6rem 1.8rem;
+        margin-bottom: 1rem;
+        background: linear-gradient(135deg, rgba(178,34,52,0.12) 0%, rgba(178,34,52,0.03) 100%);
+        border: 1px solid rgba(178,34,52,0.35);
+        border-left: 6px solid #b22234;
+    }
+    .risk-hero.flood {
+        background: linear-gradient(135deg, rgba(31,119,180,0.10) 0%, rgba(31,119,180,0.03) 100%);
+        border: 1px solid rgba(31,119,180,0.30);
+        border-left: 6px solid #1f77b4;
+        padding: 1.2rem 1.6rem;
+    }
+    .section-eyebrow {
+        font-size: 0.78rem; font-weight: 700; letter-spacing: 0.12em; text-transform: uppercase;
+        opacity: 0.65; margin-bottom: 0.2rem;
+    }
+    .section-title { font-size: 1.5rem; font-weight: 800; margin: 0 0 0.6rem 0; }
+    .section-title.flood { font-size: 1.15rem; margin-bottom: 0.4rem; }
+
+    .cresta-chip {
+        display: inline-flex; align-items: center; gap: 0.4rem;
+        background: rgba(178,34,52,0.15); border: 1px solid rgba(178,34,52,0.4);
+        border-radius: 999px; padding: 0.35rem 0.9rem; font-weight: 700; font-size: 0.95rem;
+        margin-bottom: 0.9rem;
+    }
+    .mini-card {
+        background: rgba(135,135,135,0.07); border-radius: 12px; padding: 0.9rem 1.1rem;
+        height: 100%; border: 1px solid rgba(135,135,135,0.15);
+    }
+    .mini-card .label { font-size: 0.75rem; opacity: 0.65; text-transform: uppercase; letter-spacing: 0.05em; font-weight: 600;}
+    .mini-card .value { font-size: 1.05rem; font-weight: 700; margin-top: 0.15rem; }
+
+    .mmi-gauge-wrap { margin: 0.8rem 0 0.3rem 0; }
+    .mmi-gauge-track {
+        position: relative; height: 14px; border-radius: 999px; margin-top: 0.5rem;
+        background: linear-gradient(90deg, #2e7d32 0%, #9e9d24 25%, #f9a825 50%, #e65100 75%, #b71c1c 100%);
+    }
+    .mmi-gauge-marker {
+        position: absolute; top: -7px; width: 4px; height: 28px; background: #ffffff;
+        border-radius: 2px; box-shadow: 0 0 0 2px rgba(0,0,0,0.55);
+    }
+    .mmi-scale-labels { display: flex; justify-content: space-between; font-size: 0.68rem; opacity: 0.55; margin-top: 0.25rem; }
+
+    .flood-strip { display: flex; flex-wrap: wrap; gap: 1.6rem; align-items: center; }
+    .flood-metric .label { font-size: 0.72rem; opacity: 0.6; text-transform: uppercase; letter-spacing: 0.04em; }
+    .flood-metric .value { font-size: 1rem; font-weight: 700; }
     </style>
     """,
     unsafe_allow_html=True,
@@ -690,82 +771,127 @@ if results is not None:
         eq_data, eq_errors = get_layer_results(results, "na_eq_hazard")
         mmi_data, mmi_errors = get_layer_results(results, "us_mmi")
 
-        col_flood, col_eq = st.columns(2)
+        cresta_code, cresta_name = get_cresta_zone(geo_data)
 
-        with col_flood:
-            st.markdown("#### 🌊 Flood")
-            if fema_data:
-                zone = fema_data.get("floodZone", "")
-                prob = fema_data.get("annualProbability", "")
-                label, detail = classify_fema_zone(zone, prob)
-                sfha = str(fema_data.get("sfha", "")).strip().lower()
-                badge = "🔴" if "high" in label.lower() else ("🟡" if "moderate" in label.lower() else "🟢")
-                st.markdown(f"**{badge} {label}** — FEMA Zone {zone or '—'}")
-                st.caption(detail)
-                mp1, mp2 = st.columns(2)
-                mp1.metric("Special Flood Hazard Area", "Yes" if sfha == "yes" else "No" if sfha == "no" else "—")
-                mp2.metric("Annual chance", prob or "—")
-            if depth_data:
-                u100 = depth_data.get("depthInlandUndef100yr")
-                u500 = depth_data.get("depthInlandUndef500yr")
-                status = depth_data.get("status", "")
-                dp1, dp2 = st.columns(2)
-                dp1.metric("100-yr flood depth", f"{u100} ft" if u100 not in (None, "") else "—")
-                dp2.metric("500-yr flood depth", f"{u500} ft" if u500 not in (None, "") else "—")
-                if status:
-                    st.caption(f"Status: {status}")
-            if susc_data and susc_data.get("dtmElevation") not in (None, ""):
-                st.caption(f"Ground elevation: {susc_data.get('dtmElevation')} ft above sea level")
-            if score_data:
-                overall = score_data.get("scoreOverall")
-                if overall not in (None, ""):
-                    st.caption(f"RMS Flood Risk Score (overall): {overall}")
-            all_flood_errs = fema_errors + depth_errors + susc_errors + score_errors
-            flood_warnings = []
-            for d in (fema_data, depth_data, susc_data, score_data):
-                w = d.get("warnings") if isinstance(d, dict) else None
-                if w:
-                    flood_warnings.append(w)
-            if flood_warnings:
-                with st.expander("⚠️ Data quality notes (flood)"):
-                    for w in flood_warnings:
-                        st.code(w if isinstance(w, str) else json.dumps(w, indent=2), language="json")
-            if not any([fema_data, depth_data, susc_data, score_data]) and not all_flood_errs:
-                st.caption("No flood layers were selected/run for this lookup.")
+        # ================================================================
+        # PRIMARY: EARTHQUAKE
+        # ================================================================
+        st.markdown('<div class="risk-hero">', unsafe_allow_html=True)
+        st.markdown('<div class="section-eyebrow">Primary peril</div>', unsafe_allow_html=True)
+        st.markdown('<div class="section-title">⚡ Earthquake Risk Profile</div>', unsafe_allow_html=True)
 
-        with col_eq:
-            st.markdown("#### 🏔️ Earthquake")
-            if eq_data:
-                soil_desc = eq_data.get("soilDescription", "")
-                liq_desc = eq_data.get("liquefactionDescription", "")
-                land_desc = eq_data.get("landslideDescription", "")
-                st.markdown(f"{soil_risk_badge(soil_desc)} **Soil type:** {soil_desc or '—'}")
-                st.markdown(f"{soil_risk_badge(liq_desc)} **Liquefaction risk:** {liq_desc or '—'}")
-                st.markdown(f"{soil_risk_badge(land_desc)} **Landslide risk:** {land_desc or '—'}")
+        if cresta_code:
+            cresta_display = f"CRESTA Zone {cresta_code}" + (f" — {cresta_name.title()}" if cresta_name else "")
+            st.markdown(f'<div class="cresta-chip">📍 {cresta_display}</div>', unsafe_allow_html=True)
+        else:
+            st.caption("CRESTA zone not returned for this location.")
+
+        if eq_data or mmi_data:
+            soil_desc = eq_data.get("soilDescription", "") if eq_data else ""
+            liq_desc = eq_data.get("liquefactionDescription", "") if eq_data else ""
+            land_desc = eq_data.get("landslideDescription", "") if eq_data else ""
+
+            c1, c2, c3 = st.columns(3)
+            for col, label, desc in (
+                (c1, "Soil Type", soil_desc), (c2, "Liquefaction Risk", liq_desc), (c3, "Landslide Risk", land_desc)
+            ):
+                with col:
+                    st.markdown(
+                        f'<div class="mini-card"><div class="label">{label}</div>'
+                        f'<div class="value">{soil_risk_badge(desc)} {desc or "—"}</div></div>',
+                        unsafe_allow_html=True,
+                    )
+
             if mmi_data:
                 mmi_475 = mmi_data.get("mmi475yr") or mmi_data.get("mmi500yr")
                 if mmi_475 not in (None, ""):
-                    st.markdown(f"**Expected shaking (475-yr / design-level event):** "
-                                f"{mmi_label(mmi_475)} (MMI {mmi_475})")
-                    st.caption("475-yr return period = ~10% chance of exceedance in 50 years, "
-                               "the standard US building-code design-level earthquake.")
-                with st.expander("Shaking intensity at other return periods"):
+                    st.markdown("<br>", unsafe_allow_html=True)
+                    st.markdown(
+                        f"**Expected shaking at the design-level event (475-yr return period):** "
+                        f"{mmi_label(mmi_475)}  ·  **MMI {mmi_475}**"
+                    )
+                    st.markdown(mmi_gauge_html(mmi_475, mmi_label(mmi_475)), unsafe_allow_html=True)
+                    st.caption("475-yr return period ≈ 10% chance of exceedance in 50 years — the standard "
+                               "US building-code design-level earthquake used for site risk comparison.")
+                with st.expander("📊 Shaking intensity at other return periods"):
                     mmi_rows = [{"Return period": k.replace("mmi", "").replace("yr", "-yr"),
                                  "MMI": v, "Description": mmi_label(v)}
                                 for k, v in mmi_data.items() if k.startswith("mmi")]
                     if mmi_rows:
-                        st.dataframe(pd.DataFrame(mmi_rows), hide_index=True, width="stretch")
-            eq_warnings = []
-            for d in (eq_data, mmi_data):
-                w = d.get("warnings") if isinstance(d, dict) else None
-                if w:
-                    eq_warnings.append(w)
-            if eq_warnings:
-                with st.expander("⚠️ Data quality notes (earthquake)"):
-                    for w in eq_warnings:
-                        st.code(w if isinstance(w, str) else json.dumps(w, indent=2), language="json")
-            if not eq_data and not mmi_data:
-                st.caption("No earthquake layers were selected/run for this lookup.")
+                        mmi_df = pd.DataFrame(mmi_rows)
+                        try:
+                            mmi_df["_sort"] = mmi_df["Return period"].str.replace("-yr", "").astype(int)
+                            mmi_df = mmi_df.sort_values("_sort").drop(columns="_sort")
+                        except (ValueError, KeyError):
+                            pass
+                        st.dataframe(mmi_df, hide_index=True, width="stretch")
+        else:
+            st.caption("No earthquake layers were selected/run for this lookup.")
+
+        eq_warnings = []
+        for d in (eq_data, mmi_data):
+            w = d.get("warnings") if isinstance(d, dict) else None
+            if w:
+                eq_warnings.append(w)
+        if eq_warnings:
+            with st.expander("⚠️ Data quality notes (earthquake)"):
+                for w in eq_warnings:
+                    st.code(w if isinstance(w, str) else json.dumps(w, indent=2), language="json")
+
+        st.markdown("</div>", unsafe_allow_html=True)
+
+        # ================================================================
+        # SECONDARY: FLOOD
+        # ================================================================
+        st.markdown('<div class="risk-hero flood">', unsafe_allow_html=True)
+        st.markdown('<div class="section-eyebrow">Secondary peril</div>', unsafe_allow_html=True)
+        st.markdown('<div class="section-title flood">🌊 Flood Risk</div>', unsafe_allow_html=True)
+
+        if any([fema_data, depth_data, susc_data, score_data]):
+            zone = fema_data.get("floodZone", "") if fema_data else ""
+            prob = fema_data.get("annualProbability", "") if fema_data else ""
+            label, detail = classify_fema_zone(zone, prob) if fema_data else ("—", "")
+            sfha = str(fema_data.get("sfha", "")).strip().lower() if fema_data else ""
+            badge = "🔴" if "high" in label.lower() else ("🟡" if "moderate" in label.lower() else "🟢")
+
+            u100 = depth_data.get("depthInlandUndef100yr") if depth_data else None
+            u500 = depth_data.get("depthInlandUndef500yr") if depth_data else None
+            elevation = susc_data.get("dtmElevation") if susc_data else None
+            overall_score = score_data.get("scoreOverall") if score_data else None
+
+            if fema_data:
+                st.markdown(f"**{badge} {label}** — FEMA Zone **{zone or '—'}**  ·  {detail}")
+
+            st.markdown('<div class="flood-strip">', unsafe_allow_html=True)
+            flood_metrics = [
+                ("SFHA", "Yes" if sfha == "yes" else "No" if sfha == "no" else "—"),
+                ("Annual chance", prob or "—"),
+                ("100-yr depth", f"{u100} ft" if u100 not in (None, "") else "—"),
+                ("500-yr depth", f"{u500} ft" if u500 not in (None, "") else "—"),
+                ("Elevation", f"{elevation} ft" if elevation not in (None, "") else "—"),
+                ("RMS Flood Score", overall_score if overall_score not in (None, "") else "—"),
+            ]
+            for m_label, m_value in flood_metrics:
+                st.markdown(
+                    f'<div class="flood-metric"><div class="label">{m_label}</div>'
+                    f'<div class="value">{m_value}</div></div>',
+                    unsafe_allow_html=True,
+                )
+            st.markdown("</div>", unsafe_allow_html=True)
+        else:
+            st.caption("No flood layers were selected/run for this lookup.")
+
+        flood_warnings = []
+        for d in (fema_data, depth_data, susc_data, score_data):
+            w = d.get("warnings") if isinstance(d, dict) else None
+            if w:
+                flood_warnings.append(w)
+        if flood_warnings:
+            with st.expander("⚠️ Data quality notes (flood)"):
+                for w in flood_warnings:
+                    st.code(w if isinstance(w, str) else json.dumps(w, indent=2), language="json")
+
+        st.markdown("</div>", unsafe_allow_html=True)
 
     st.divider()
     header_col1, header_col2 = st.columns([3, 1])
