@@ -315,6 +315,97 @@ def resolve_admin1_code(geo_payload, fallback_admin1):
 
 STATUS_ICON = {"OK": "✅", "ERROR": "⚠️"}
 
+# Confirmed mapping for rmsGeoModelResolutionCode, sourced directly from a
+# working RMS VBA macro's ResDesc() function (comment: "Source:
+# RMS_EDM.Lookup.GeoResolutionCode"). Lower code = higher precision.
+MODEL_RESOLUTION_LABELS = {
+    0: "None", 1: "Coordinate", 2: "Parcel", 3: "Street Block", 4: "Street Name",
+    5: "Postcode", 6: "City District", 7: "City", 8: "District", 9: "County",
+    10: "State", 11: "Accumulation Zone", 12: "Multiple", 13: "User Defined", 14: "Country",
+}
+# Precision tier used for the underwriting quality badge - parcel/coordinate
+# level is as good as it gets for siting a risk; postcode-and-up means the
+# hazard results below are increasingly an area estimate, not a site-specific read.
+MODEL_RESOLUTION_TIER = {
+    0: ("⚠️", "Unresolved"), 1: ("🎯", "Rooftop / coordinate-level"), 2: ("🎯", "Parcel-level"),
+    3: ("✅", "Street block-level"), 4: ("✅", "Street-level"), 5: ("🟡", "Postcode-level"),
+    6: ("🟡", "City district-level"), 7: ("🟡", "City-level"), 8: ("🟠", "District-level"),
+    9: ("🟠", "County-level"), 10: ("🔴", "State-level"), 11: ("🔴", "Accumulation zone-level"),
+    12: ("🔴", "Multiple/ambiguous match"), 13: ("🟡", "User-defined"), 14: ("🔴", "Country-level only"),
+}
+
+# Standard, publicly documented FEMA/NFIP flood zone classifications.
+# https://www.fema.gov/glossary/flood-zones
+FEMA_ZONE_INFO = {
+    "A": ("High risk (SFHA)", "1% annual chance flood (100-yr); flood insurance federally required if mortgaged."),
+    "AE": ("High risk (SFHA)", "1% annual chance flood (100-yr) with defined base flood elevations; flood insurance federally required if mortgaged."),
+    "AH": ("High risk (SFHA)", "1% annual chance shallow flooding (ponding); flood insurance federally required if mortgaged."),
+    "AO": ("High risk (SFHA)", "1% annual chance shallow flooding (sheet flow); flood insurance federally required if mortgaged."),
+    "AR": ("High risk (SFHA)", "Temporarily elevated risk behind a flood-control system under restoration; flood insurance federally required if mortgaged."),
+    "A99": ("High risk (SFHA)", "1% annual chance flood, protected by a federal flood-control system under construction; flood insurance federally required if mortgaged."),
+    "V": ("High risk coastal (SFHA)", "1% annual chance coastal flood with wave hazard; flood insurance federally required if mortgaged."),
+    "VE": ("High risk coastal (SFHA)", "1% annual chance coastal flood with high-velocity wave action; flood insurance federally required if mortgaged."),
+    "B": ("Moderate risk", "Between 0.2%-1% annual chance flood (500-yr); outside the mandatory purchase zone but insurance recommended."),
+    "X": ("Minimal to moderate risk", "Outside the 1% floodplain; exact tier depends on the annual probability value shown below."),
+    "C": ("Minimal risk", "Outside the 500-yr floodplain; flood insurance not federally required."),
+    "D": ("Undetermined", "Flood hazard has not been formally studied for this area."),
+}
+
+
+def classify_fema_zone(zone, annual_probability):
+    """Combine the raw FEMA zone letter with the annualProbability field
+    (which RMS already resolves precisely) to give an accurate risk tier -
+    this avoids guessing 'shaded vs unshaded X' from the letter alone."""
+    zone = (zone or "").strip().upper()
+    info = FEMA_ZONE_INFO.get(zone)
+    label, detail = info if info else ("Unknown zone", "Zone code not recognized - verify manually.")
+    prob = (annual_probability or "").strip()
+    if zone == "X" and prob:
+        if "0.2" in prob or "less than" in prob.lower():
+            label, detail = "Minimal risk", f"Outside the 1% floodplain, annual chance {prob}; flood insurance not federally required."
+        else:
+            label, detail = "Moderate risk", f"Zone X with elevated annual chance {prob}; consider flood insurance."
+    return label, detail
+
+
+# Modified Mercalli Intensity scale labels, confirmed from a working RMS
+# VBA macro's mLH_MmiDict (built from standard USGS MMI descriptions).
+MMI_LABELS = {
+    1: "Not Felt", 2: "Weak", 3: "Weak", 4: "Light", 5: "Moderate", 6: "Strong",
+    7: "Very Strong", 8: "Severe", 9: "Violent", 10: "Extreme", 11: "Extreme", 12: "Extreme",
+}
+
+
+def mmi_label(value):
+    try:
+        v = round(float(value))
+    except (TypeError, ValueError):
+        return "Unknown"
+    v = max(1, min(12, v))
+    return MMI_LABELS.get(v, "Unknown")
+
+
+def soil_risk_badge(description):
+    """Qualitative descriptions already come back in plain English from
+    na_eq_hazard; this just adds a consistent risk-colored badge."""
+    d = (description or "").lower()
+    if not d or d in ("n/a", "unknown"):
+        return "⚪"
+    if "very low" in d or d == "low":
+        return "🟢"
+    if "low to moderate" in d or "moderate" in d:
+        return "🟡"
+    if "high" in d or "severe" in d:
+        return "🔴"
+    return "🟢" if "stiff" in d or "rock" in d else "🟡"
+
+
+def get_layer_results(results, layer_name):
+    for entry in results or []:
+        if entry.get("name") == layer_name:
+            return entry.get("results") or {}, entry.get("errors") or []
+    return {}, []
+
 
 # --------------------------------------------------------------------------
 # Streamlit UI
@@ -561,16 +652,125 @@ if results is not None:
             ]))
             st.markdown(city_line or "—")
             st.caption(format_latlon_caption(latlon[0], latlon[1]))
-            m1, m2 = st.columns(2)
-            m1.metric("Match resolution", geo_data.get("rmsGeocodingResolutionCode", "—"))
-            m2.metric("Model resolution", geo_data.get("rmsGeoModelResolutionCode", "—"))
+
+            model_code = geo_data.get("rmsGeoModelResolutionCode")
+            try:
+                model_code_int = int(model_code)
+            except (TypeError, ValueError):
+                model_code_int = None
+            icon, tier_label = MODEL_RESOLUTION_TIER.get(model_code_int, ("⚪", "Unknown"))
+            model_label = MODEL_RESOLUTION_LABELS.get(model_code_int, "Unknown")
+            confidence = geo_data.get("geoResolutionConfidence")
+
+            st.markdown(f"**{icon} Geocode quality: {tier_label}**")
+            conf_text = f" · {confidence}% confidence" if confidence not in (None, "") else ""
+            st.caption(f"Matched to {model_label.lower()} precision{conf_text}.")
+            if model_code_int is not None and model_code_int >= 9:
+                st.warning(
+                    "This address only resolved to a broad area (county/state level or coarser) - "
+                    "the hazard results below are area averages, not a site-specific read. Consider "
+                    "confirming the address details before relying on this for risk selection."
+                )
     else:
         st.info("No coordinates were returned for this address - check the geocode result below.")
+
+    # ------------------------------------------------------------------
+    # Underwriting Risk Summary - translates raw hazard fields into the
+    # plain-English, risk-selection-oriented view an underwriter needs,
+    # before the full technical detail further down.
+    # ------------------------------------------------------------------
+    if latlon and latlon[0] is not None and latlon[1] is not None:
+        st.divider()
+        st.subheader("🧭 Underwriting Risk Summary")
+
+        fema_data, fema_errors = get_layer_results(results, "us_fema_firm")
+        depth_data, depth_errors = get_layer_results(results, "us_fl_depth")
+        susc_data, susc_errors = get_layer_results(results, "us_fl_susceptibility")
+        score_data, score_errors = get_layer_results(results, "us_fl_risk_score")
+        eq_data, eq_errors = get_layer_results(results, "na_eq_hazard")
+        mmi_data, mmi_errors = get_layer_results(results, "us_mmi")
+
+        col_flood, col_eq = st.columns(2)
+
+        with col_flood:
+            st.markdown("#### 🌊 Flood")
+            if fema_data:
+                zone = fema_data.get("floodZone", "")
+                prob = fema_data.get("annualProbability", "")
+                label, detail = classify_fema_zone(zone, prob)
+                sfha = str(fema_data.get("sfha", "")).strip().lower()
+                badge = "🔴" if "high" in label.lower() else ("🟡" if "moderate" in label.lower() else "🟢")
+                st.markdown(f"**{badge} {label}** — FEMA Zone {zone or '—'}")
+                st.caption(detail)
+                mp1, mp2 = st.columns(2)
+                mp1.metric("Special Flood Hazard Area", "Yes" if sfha == "yes" else "No" if sfha == "no" else "—")
+                mp2.metric("Annual chance", prob or "—")
+            if depth_data:
+                u100 = depth_data.get("depthInlandUndef100yr")
+                u500 = depth_data.get("depthInlandUndef500yr")
+                status = depth_data.get("status", "")
+                dp1, dp2 = st.columns(2)
+                dp1.metric("100-yr flood depth", f"{u100} ft" if u100 not in (None, "") else "—")
+                dp2.metric("500-yr flood depth", f"{u500} ft" if u500 not in (None, "") else "—")
+                if status:
+                    st.caption(f"Status: {status}")
+            if susc_data and susc_data.get("dtmElevation") not in (None, ""):
+                st.caption(f"Ground elevation: {susc_data.get('dtmElevation')} ft above sea level")
+            if score_data:
+                overall = score_data.get("scoreOverall")
+                if overall not in (None, ""):
+                    st.caption(f"RMS Flood Risk Score (overall): {overall}")
+            all_flood_errs = fema_errors + depth_errors + susc_errors + score_errors
+            flood_warnings = []
+            for d in (fema_data, depth_data, susc_data, score_data):
+                w = d.get("warnings") if isinstance(d, dict) else None
+                if w:
+                    flood_warnings.append(w)
+            if flood_warnings:
+                with st.expander("⚠️ Data quality notes (flood)"):
+                    for w in flood_warnings:
+                        st.code(w if isinstance(w, str) else json.dumps(w, indent=2), language="json")
+            if not any([fema_data, depth_data, susc_data, score_data]) and not all_flood_errs:
+                st.caption("No flood layers were selected/run for this lookup.")
+
+        with col_eq:
+            st.markdown("#### 🏔️ Earthquake")
+            if eq_data:
+                soil_desc = eq_data.get("soilDescription", "")
+                liq_desc = eq_data.get("liquefactionDescription", "")
+                land_desc = eq_data.get("landslideDescription", "")
+                st.markdown(f"{soil_risk_badge(soil_desc)} **Soil type:** {soil_desc or '—'}")
+                st.markdown(f"{soil_risk_badge(liq_desc)} **Liquefaction risk:** {liq_desc or '—'}")
+                st.markdown(f"{soil_risk_badge(land_desc)} **Landslide risk:** {land_desc or '—'}")
+            if mmi_data:
+                mmi_475 = mmi_data.get("mmi475yr") or mmi_data.get("mmi500yr")
+                if mmi_475 not in (None, ""):
+                    st.markdown(f"**Expected shaking (475-yr / design-level event):** "
+                                f"{mmi_label(mmi_475)} (MMI {mmi_475})")
+                    st.caption("475-yr return period = ~10% chance of exceedance in 50 years, "
+                               "the standard US building-code design-level earthquake.")
+                with st.expander("Shaking intensity at other return periods"):
+                    mmi_rows = [{"Return period": k.replace("mmi", "").replace("yr", "-yr"),
+                                 "MMI": v, "Description": mmi_label(v)}
+                                for k, v in mmi_data.items() if k.startswith("mmi")]
+                    if mmi_rows:
+                        st.dataframe(pd.DataFrame(mmi_rows), hide_index=True, width="stretch")
+            eq_warnings = []
+            for d in (eq_data, mmi_data):
+                w = d.get("warnings") if isinstance(d, dict) else None
+                if w:
+                    eq_warnings.append(w)
+            if eq_warnings:
+                with st.expander("⚠️ Data quality notes (earthquake)"):
+                    for w in eq_warnings:
+                        st.code(w if isinstance(w, str) else json.dumps(w, indent=2), language="json")
+            if not eq_data and not mmi_data:
+                st.caption("No earthquake layers were selected/run for this lookup.")
 
     st.divider()
     header_col1, header_col2 = st.columns([3, 1])
     with header_col1:
-        st.subheader("🌪️ Hazard results")
+        st.subheader("📋 Full hazard data (technical detail)")
     with header_col2:
         if hazard_entries:
             st.markdown(
