@@ -93,13 +93,22 @@ DEFAULT_LAYERS = [
 class LocationIntelligenceApi:
     """Thin, resilient wrapper around the RMS Location Intelligence API."""
 
-    def __init__(self, host, api_key, auth_style="Bearer token", verify=True, pool_size=16):
+    def __init__(self, host, api_key, auth_style="API key (raw)", verify=True, pool_size=16):
         self.base_url = f"https://{host}/li"
         self.session = requests.Session()
         adapter = HTTPAdapter(pool_connections=pool_size, pool_maxsize=pool_size)
         self.session.mount("https://", adapter)
         self.session.mount("http://", adapter)
-        auth_value = f"Bearer {api_key}" if auth_style == "Bearer token" else api_key
+        # RMS's own docs show the Authorization header as the raw API key with NO
+        # "Bearer " prefix: `Authorization: {api_key}`. Only OAuth access tokens
+        # (a different credential type) would use "Bearer <token>".
+        # https://developer.rms.com/location-intelligence/docs/authentication-and-authorization
+        clean_key = (api_key or "").strip()
+        # Guard against accidentally double-prefixing if a user pastes a key that
+        # already includes "Bearer " themselves.
+        if clean_key.lower().startswith("bearer "):
+            clean_key = clean_key[7:].strip()
+        auth_value = f"Bearer {clean_key}" if auth_style == "OAuth access token" else clean_key
         self.session.headers.update({
             "Accept": "application/json",
             "Content-Type": "application/json",
@@ -232,13 +241,32 @@ with st.sidebar:
     host = st.text_input("Host", value=DEFAULT_HOST, help="api-euw1.rms.com or api-use1.rms.com")
     api_key = st.text_input("API key", value=API_KEY, type="password",
                              help="Defaults to the RMS_LI_API_KEY environment variable.")
-    auth_style = st.selectbox("Auth header style", ["Bearer token", "API key (raw)"], index=0)
+    auth_style = st.selectbox(
+        "Credential type",
+        ["API key (raw)", "OAuth access token"],
+        index=0,
+        help="RMS's recommended, production credential is a raw API key sent as "
+             "'Authorization: {api_key}' (no 'Bearer ' prefix). Only choose "
+             "'OAuth access token' if your tenant issued you a short-lived OAuth "
+             "token instead - that is sent as 'Authorization: Bearer {token}'.",
+    )
     verify_ssl = st.checkbox("Verify SSL", value=True,
                               help="Uncheck only if you hit corporate SSL/proxy errors.")
     region_code = st.text_input("Region code", value="us",
                                  help="Prefix used in <region>_<peril>_hazard layer names, "
                                       "e.g. 'us', 'ca', 'eu', 'au'.")
     version_default = st.text_input("Default layer version", value="latest")
+
+    st.divider()
+    st.caption(
+        "**If you get HTTP 401 Unauthorized:** this almost always means either (a) the "
+        "Authorization header format is wrong for this credential type, or (b) this specific "
+        "API key is not entitled/licensed for the **Location Intelligence** product. Location "
+        "Intelligence is a separately licensed API from Risk Modeler / Risk Data API - a key "
+        "that works for analysis/AAL lookups will *not* automatically work here. Confirm with "
+        "your tenant admin that this key (or a new one) has Location Intelligence access."
+    )
+    test_conn = st.button("🔌 Test connection (geocode only)")
 
 st.subheader("1. Address")
 col1, col2, col3, col4 = st.columns([3, 2, 1, 1])
@@ -251,6 +279,37 @@ with col3:
 with col4:
     postal = st.text_input("Postal code", placeholder="15033")
 country_code = st.text_input("Country code (ISO2)", value="US", max_chars=2)
+
+if test_conn:
+    if not api_key:
+        st.warning("Please provide an API key (sidebar) before testing the connection.")
+    else:
+        test_api = LocationIntelligenceApi(host.strip(), api_key, auth_style=auth_style, verify=verify_ssl)
+        test_address = {
+            "countryCode": "US", "countryScheme": "ISO2A",
+            "streetAddress": "7575 Gateway Blvd", "cityName": "Newark",
+            "admin1Code": "CA", "postalCode": "94560",
+        }
+        with st.spinner("Sending a minimal test geocode request..."):
+            test_payload, test_status, test_error = test_api.geocode(test_address, version_default)
+        st.write(f"**Request URL:** `https://{host.strip()}/li/geocode/{version_default}`")
+        st.write(f"**Auth header sent:** `Authorization: {'Bearer ' if auth_style == 'OAuth access token' else ''}{'*' * max(len(api_key.strip()) - 4, 0)}{api_key.strip()[-4:] if len(api_key.strip()) >= 4 else ''}`")
+        st.write(f"**HTTP status:** `{test_status}`")
+        if test_status == 200:
+            st.success("✅ Connection succeeded - this API key and host are authorized for Location Intelligence.")
+            st.json(test_payload)
+        elif test_status == 401:
+            st.error(
+                "❌ 401 Unauthorized. The host and key were reachable, but rejected. Most likely "
+                "causes: (1) this API key is provisioned for a different RMS product (e.g. Risk "
+                "Modeler / Risk Data API) and does not have Location Intelligence entitlements, or "
+                "(2) the key has expired or was revoked. Contact your tenant admin to confirm this "
+                "key (or request a new one) is licensed specifically for Location Intelligence."
+            )
+            st.json(test_error)
+        else:
+            st.error(f"Request failed with HTTP {test_status}.")
+            st.json(test_error)
 
 st.subheader("2. Hazard layers to look up")
 st.caption(
