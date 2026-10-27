@@ -100,18 +100,24 @@ ERROR_CODES = {
 # tenant differs.
 DEFAULT_LAYERS = [
     {"Hazard": "US FEMA FIRM (flood zone)", "Layer": "us_fema_firm", "Version": "latest",
+     "BodyStyle": "flood_basic",
      "LayerOptions": '{"distanceUnit":"feet","proximityDistance":100}', "Confirmed": "Yes", "Selected": True},
     {"Hazard": "US Flood Depth (undefended)", "Layer": "us_fl_depth", "Version": "latest",
+     "BodyStyle": "flood_basic",
      "LayerOptions": '{"lookup":"floodDepth","proximityDistance":100,"distanceUnit":"feet"}',
      "Confirmed": "Yes", "Selected": True},
     {"Hazard": "Elevation / Susceptibility", "Layer": "us_fl_susceptibility", "Version": "latest",
-     "LayerOptions": "", "Confirmed": "Yes", "Selected": True},
-    {"Hazard": "Earthquake (name unconfirmed)", "Layer": "us_eq_sitehazard", "Version": "latest",
-     "LayerOptions": "", "Confirmed": "No - edit before use", "Selected": False},
+     "BodyStyle": "full", "LayerOptions": "", "Confirmed": "Yes", "Selected": True},
+    {"Hazard": "US Flood Risk Score", "Layer": "us_fl_risk_score", "Version": "latest",
+     "BodyStyle": "full", "LayerOptions": "", "Confirmed": "Yes", "Selected": True},
+    {"Hazard": "Earthquake (soil/liquefaction/landslide)", "Layer": "na_eq_hazard", "Version": "latest",
+     "BodyStyle": "minimal", "LayerOptions": "", "Confirmed": "Yes", "Selected": True},
+    {"Hazard": "Earthquake Intensity (MMI)", "Layer": "us_mmi", "Version": "latest",
+     "BodyStyle": "minimal", "LayerOptions": "", "Confirmed": "Yes", "Selected": True},
     {"Hazard": "Windstorm (name unconfirmed)", "Layer": "us_hu_hazard", "Version": "latest",
-     "LayerOptions": "", "Confirmed": "No - edit before use", "Selected": False},
+     "BodyStyle": "minimal", "LayerOptions": "", "Confirmed": "No - edit before use", "Selected": False},
     {"Hazard": "Wildfire (name unconfirmed)", "Layer": "us_wf_hazard", "Version": "latest",
-     "LayerOptions": "", "Confirmed": "No - edit before use", "Selected": False},
+     "BodyStyle": "minimal", "LayerOptions": "", "Confirmed": "No - edit before use", "Selected": False},
 ]
 
 
@@ -198,9 +204,32 @@ class LocationIntelligenceApi:
         return self._post(f"geocode/{version}", body)
 
     def hazard_lookup(self, lat, lon, admin1_code, country_code, resolution_code,
-                       layer, version, layer_options=None):
-        """Nested location/characteristics/coverageValues body - matches
-        BuildBody() in the VBA macro exactly."""
+                       layer, version, body_style="full", layer_options=None,
+                       characteristics=None, coverage_values=None):
+        """Builds the request body in one of three CONFIRMED-WORKING shapes,
+        ported directly from two working RMS VBA macros (modFloodGeo and
+        modLocationsHazard):
+
+          "minimal"     -> {"location":{"address":{...}}}
+                           Used for simple hazard layers that need only
+                           coordinates: na_eq_hazard (earthquake soil/
+                           liquefaction/landslide), us_mmi (earthquake
+                           intensity).
+
+          "flood_basic" -> {"location":{"address":{...},"characteristics":{},
+                             "coverageValues":{}}, "layerOptions":{...}}
+                           Used for us_fema_firm (flood zone) and us_fl_depth
+                           (flood depth) - empty characteristics/coverage
+                           objects are still required, plus layerOptions as
+                           a SIBLING of "location" (not nested inside it).
+
+          "full"        -> {"location":{"address":{...},
+                             "characteristics":{full building attrs},
+                             "coverageValues":{full coverage amounts}}}
+                           Used for us_fl_susceptibility (elevation) and
+                           us_fl_risk_score (needs real building attributes
+                           to score accurately).
+        """
         address = {
             "countryScheme": "ISO2A",
             "countryCode": country_code,
@@ -212,21 +241,27 @@ class LocationIntelligenceApi:
         address["longitude"] = lon
         address["rmsGeoModelResolutionCode"] = resolution_code
 
-        body = {
-            "location": {
-                "address": address,
-                "characteristics": {
-                    "construction": "ATC0", "occupancy": "ATC0", "yearBuilt": 0,
-                    "numOfStories": 0, "foundationType": 0,
-                    "firstFloorHeightAboveGround": 0, "basement": "DEFAULT", "floorArea": 0,
-                },
-                "coverageValues": {
-                    "buildingValue": 0, "contentsValue": 0, "businessInterruptionValue": 0,
-                },
+        location = {"address": address}
+
+        if body_style == "minimal":
+            pass  # location.address only - no characteristics/coverageValues at all
+        elif body_style == "flood_basic":
+            location["characteristics"] = {}
+            location["coverageValues"] = {}
+        else:  # "full"
+            location["characteristics"] = characteristics or {
+                "construction": "ATC0", "occupancy": "ATC0", "yearBuilt": 0,
+                "numOfStories": 0, "foundationType": 0,
+                "firstFloorHeightAboveGround": 0, "basement": "DEFAULT", "floorArea": 0,
             }
-        }
-        if layer_options:
-            body["layerOptions"] = layer_options
+            location["coverageValues"] = coverage_values or {
+                "buildingValue": 0, "contentsValue": 0, "businessInterruptionValue": 0,
+            }
+
+        body = {"location": location}
+        if body_style == "flood_basic" and layer_options:
+            body["layerOptions"] = layer_options  # sibling of "location", not nested inside it
+
         return self._post(f"{layer}/{version}", body)
 
 
@@ -340,6 +375,22 @@ with col4:
     postal = st.text_input("Postal code", placeholder="07760")
 country_code = st.text_input("Country code (ISO2)", value="US", max_chars=2)
 
+with st.expander("🏗️ Building characteristics (optional - improves accuracy for Elevation & Flood Risk Score)"):
+    bc1, bc2, bc3, bc4 = st.columns(4)
+    with bc1:
+        bld_construction = st.text_input("Construction code", value="ATC0")
+        bld_occupancy = st.text_input("Occupancy code", value="ATC0")
+    with bc2:
+        bld_year_built = st.number_input("Year built", value=0, step=1)
+        bld_stories = st.number_input("# of stories", value=0, step=1)
+    with bc3:
+        bld_value = st.number_input("Building value", value=0, step=1000)
+        bld_contents_value = st.number_input("Contents value", value=0, step=1000)
+    with bc4:
+        bld_bi_value = st.number_input("BI value", value=0, step=1000)
+    st.caption("Defaults (ATC0 / 0) match the proven macro's fallback and will still return results - "
+               "fill these in only if you want building-specific risk scoring.")
+
 if test_conn:
     if not api_key:
         st.warning("Please provide an API key (sidebar) before testing the connection.")
@@ -370,13 +421,13 @@ if test_conn:
 
 st.subheader("2. Hazard layers to look up")
 st.caption(
-    "✅ The first 3 rows (FEMA FIRM, Flood Depth, Elevation/Susceptibility) use the exact request "
-    "shape confirmed working in your RMS workbook macro - these just work. "
-    "⚠️ The remaining rows are **unconfirmed guesses** at the layer name - the US product line does "
-    "not follow the generic `<region>_<peril>_hazard` pattern used for other regions, so these will "
-    "likely return 'No details found for layer name...' until you correct the name. Find the exact "
-    "name in your tenant's Postman collection / OpenAPI spec (Developer Assets on developer.rms.com), "
-    "or in an existing working macro/report, then edit the 'Layer name' cell directly below."
+    "✅ Confirmed layers (FEMA FIRM, Flood Depth, Elevation/Susceptibility, Flood Risk Score, "
+    "Earthquake, MMI) are ported directly from two working RMS workbook macros - these just work. "
+    "⚠️ Windstorm/Wildfire layer names are **unconfirmed guesses** - the US product line does not "
+    "follow the generic `<region>_<peril>_hazard` pattern used for other regions, so these may return "
+    "'No details found for layer name...' until corrected. Find the exact name in your tenant's "
+    "Postman collection / OpenAPI spec (Developer Assets on developer.rms.com), then edit the "
+    "'Layer name' cell below."
 )
 
 catalog_df = pd.DataFrame(DEFAULT_LAYERS)
@@ -388,6 +439,8 @@ edited_df = st.data_editor(
         "Hazard": st.column_config.TextColumn("Hazard", disabled=True),
         "Layer": st.column_config.TextColumn("Layer name"),
         "Version": st.column_config.TextColumn("Version"),
+        "BodyStyle": st.column_config.TextColumn("Body shape", disabled=True,
+                                                  help="minimal / flood_basic / full - controls the request body shape sent to RMS."),
         "LayerOptions": st.column_config.TextColumn("Layer options (JSON, optional)"),
         "Confirmed": st.column_config.TextColumn("Confirmed?", disabled=True),
     },
@@ -431,13 +484,26 @@ if run:
                     row for _, row in edited_df.iterrows()
                     if row.get("Selected") and str(row.get("Layer", "")).strip()
                 ]
+                characteristics = {
+                    "construction": bld_construction or "ATC0", "occupancy": bld_occupancy or "ATC0",
+                    "yearBuilt": int(bld_year_built), "numOfStories": int(bld_stories),
+                    "foundationType": 0, "firstFloorHeightAboveGround": 0,
+                    "basement": "DEFAULT", "floorArea": 0,
+                }
+                coverage_values = {
+                    "buildingValue": int(bld_value), "contentsValue": int(bld_contents_value),
+                    "businessInterruptionValue": int(bld_bi_value),
+                }
+
                 with st.spinner(f"Looking up {len(selected_layers)} hazard layer(s)..."):
                     for row in selected_layers:
                         layer_options = parse_layer_options(row.get("LayerOptions"))
+                        body_style = row.get("BodyStyle") or "full"
                         r_payload, r_status, r_error = api.hazard_lookup(
                             lat, lon, resolved_admin1, country_code.strip().upper() or "US",
                             resolution_code, row["Layer"], row["Version"] or version_default,
-                            layer_options,
+                            body_style=body_style, layer_options=layer_options,
+                            characteristics=characteristics, coverage_values=coverage_values,
                         )
                         if r_status == 200 and r_payload is not None:
                             results.append({"name": row["Layer"], "version": row["Version"],
